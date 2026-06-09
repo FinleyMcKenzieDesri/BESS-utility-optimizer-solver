@@ -66,6 +66,25 @@ HYBRID_SCARCITY_WEIGHT   = 0.5   # retained for reference; stress reserve is alw
 # as high-stress and prioritized in the scarcity strategy
 GRID_STRESS_HIGH_THRESHOLD = 2000   # MWh above forecast
 
+# ── Rolling-horizon arbitrage (realism: no perfect foresight) ─────────────────
+# DA arbitrage is solved in sequential windows of this length, each optimizing
+# only over prices inside the window, with SOC carried forward between windows.
+# RT arbitrage is intentionally left as a single full-foresight solve, so it
+# remains an upper-bound ceiling for reference.
+ROLLING_WINDOW_HOURS = 48
+
+# ── Battery degradation (realism: cycling has a wear cost) ────────────────────
+# Per-MWh cost of terminal throughput (charge + discharge), subtracted in the LP
+# objective so the optimizer only cycles when the price spread clears this hurdle.
+DEGRADATION_COST_PER_MWH = 0   # $/MWh of throughput
+
+# ── Charging energy source (realism: solar-charged vs grid-charged) ───────────
+#   "solar" → charging is treated as FREE in the objective (co-located PV).
+#   "grid"  → charging is priced at the node LMP, as before.
+# NOTE: this lever affects only the optimizer's objective/decisions; market
+# settlement below still values the net dispatch at market prices.
+CHARGE_SOURCE = "solar"   # "solar" or "grid"
+
 # ── Behavioral analysis — characterize HOW actual dispatch tracks each strategy
 DISCHARGE_THRESHOLD_KW = 1000    # |power| above this counts as a dispatch event
 HIGH_PRICE_QUANTILE    = 0.75    # "high price" regime = RT LMP above this quantile
@@ -105,7 +124,8 @@ def pro_rate_cycles(max_cycles_year, n_days):
 
 
 def run_lp(price_signal, capacity_mw, capacity_mwh, rte,
-           max_cycles, intervals_per_hour=12, discharge_mask=None):
+           max_cycles, intervals_per_hour=12, discharge_mask=None,
+           soc_initial=None, charge_price_signal=None, degradation_cost=0.0):
     """
     Core LP optimizer. Maximizes revenue from battery dispatch given
     a price signal ($/MWh at each 5-min interval).
@@ -135,6 +155,27 @@ def run_lp(price_signal, capacity_mw, capacity_mwh, rte,
     T   = len(price_signal)
     dt  = 1.0 / intervals_per_hour   # hours per interval
 
+    price_signal = pd.Series(price_signal).reset_index(drop=True)
+    # Charging MUST be valued at the same market price that settlement uses,
+    # otherwise the LP and the revenue report disagree. The earlier "free solar
+    # charging" override (charge_price_signal = zeros) decoupled them: seeing
+    # charging as free, the optimizer would charge at arbitrary high-price
+    # intervals, and settlement (net power × LMP) then booked those purchases as
+    # real cost — driving every strategy's revenue negative (worsened by CAISO's
+    # negative-price hours). We therefore always price charging at the node /
+    # settlement price here, so the optimizer only charges when it is profitable
+    # and the optimum is guaranteed non-negative (doing nothing scores 0).
+    #
+    # charge_price_signal is kept in the signature for future per-source modeling
+    # but is intentionally NOT used to zero the charge cost. Behind-the-meter
+    # solar should be modeled with an explicit PV energy balance, not a
+    # free-charge objective that settlement does not honor.
+    charge_price = price_signal
+    # Initial SOC: carried from the prior rolling window, or seeded from the
+    # project's actual first SOC reading (see caller). None → 50% fallback.
+    if soc_initial is None:
+        soc_initial = capacity_mwh * 0.5
+
     prob = pulp.LpProblem("battery_dispatch", pulp.LpMaximize)
 
     # Decision variables
@@ -154,15 +195,19 @@ def run_lp(price_signal, capacity_mw, capacity_mwh, rte,
     soc       = [pulp.LpVariable(f"s_{t}", lowBound=0, upBound=capacity_mwh)
                  for t in range(T)]
 
-    # Objective: maximize revenue from discharging, minus cost of charging
-    # Price signal is $/MWh; power is MW; dt is hours → revenue in $
+    # Objective: discharge revenue − charging cost − degradation cost.
+    # Price signal is $/MWh; power is MW; dt is hours → dollars.
+    #   - charging is priced at the node / settlement price (charge_price)
+    #   - degradation_cost penalizes terminal throughput (charge + discharge MWh)
+    #     so the optimizer only cycles when the spread clears that wear hurdle
     prob += pulp.lpSum(
-        (discharge[t] - charge[t]) * price_signal[t] * dt
+        discharge[t] * price_signal[t] * dt
+        - charge[t]  * charge_price[t] * dt
+        - (charge[t] + discharge[t]) * dt * degradation_cost
         for t in range(T)
     )
 
-    # SOC dynamics
-    soc_initial = capacity_mwh * 0.5   # start at 50% SOC
+    # SOC dynamics (soc_initial resolved above)
     for t in range(T):
         if t == 0:
             prob += soc[t] == soc_initial + charge[t] * rte * dt - discharge[t] * dt
@@ -195,12 +240,60 @@ def run_lp(price_signal, capacity_mw, capacity_mwh, rte,
         soc_vals.append(max(0, min(capacity_mwh, new_soc)))
     results["optimal_soc_pct"] = [s / capacity_mwh * 100 for s in soc_vals[1:]]
 
-    # Revenue per interval
+    # Per-interval revenue at this solve's own price signal. Main recomputes the
+    # reported revenue with single-basis settlement (each strategy on the price
+    # it optimized against), which matches this for the non-rolling solves.
     results["optimal_revenue_usd"] = (
         results["optimal_power_kw"] / 1000 * price_signal.values * dt
     )
 
-    return results
+    # Return final (clamped) SOC so a rolling-horizon caller can chain windows.
+    return results, soc_vals[-1]
+
+
+def run_lp_rolling(price_signal, capacity_mw, capacity_mwh, rte, max_cycles,
+                   window_intervals, intervals_per_hour=12, discharge_mask=None,
+                   soc_initial=None, charge_price_signal=None,
+                   degradation_cost=0.0):
+    """
+    Rolling-horizon wrapper around run_lp (realism: no perfect foresight).
+
+    Solves sequential, non-overlapping windows of `window_intervals` length.
+    Each window optimizes ONLY over the prices inside it — the solver sees no
+    information past the window edge — and the ending SOC of one window is
+    carried in as the starting SOC of the next, so the battery state is
+    continuous across the full horizon.
+
+    The annual cycle budget is pro-rated to each window by its share of the
+    horizon (window_len / T), so the cumulative cycle limit still binds roughly
+    as it would in a single full solve.
+
+    Returns (concatenated_results, final_soc), matching run_lp's contract.
+    """
+    price_signal = pd.Series(price_signal).reset_index(drop=True)
+    T = len(price_signal)
+    if soc_initial is None:
+        soc_initial = capacity_mwh * 0.5
+    cp = (None if charge_price_signal is None
+          else pd.Series(charge_price_signal).reset_index(drop=True))
+
+    pieces = []
+    soc = soc_initial
+    for start in range(0, T, window_intervals):
+        end = min(start + window_intervals, T)
+        w_price  = price_signal.iloc[start:end].reset_index(drop=True)
+        w_mask   = None if discharge_mask is None else discharge_mask[start:end]
+        w_cp     = None if cp is None else cp.iloc[start:end].reset_index(drop=True)
+        w_cycles = max_cycles * ((end - start) / T)
+        res, soc = run_lp(
+            w_price, capacity_mw, capacity_mwh, rte, w_cycles,
+            intervals_per_hour=intervals_per_hour, discharge_mask=w_mask,
+            soc_initial=soc, charge_price_signal=w_cp,
+            degradation_cost=degradation_cost,
+        )
+        pieces.append(res)
+
+    return pd.concat(pieces, ignore_index=True), soc
 
 
 def strategy_match_score(actual_kw, optimal_kw):
@@ -214,9 +307,88 @@ def strategy_match_score(actual_kw, optimal_kw):
     return float(np.corrcoef(actual_kw[mask], optimal_kw[mask])[0, 1])
 
 
+def dispatch_similarity(actual_kw, optimal_kw):
+    """
+    Magnitude-aware match metrics, reported alongside Pearson (Change 6).
+
+    Pearson correlation is scale-invariant: a tiny-but-perfectly-timed dispatch
+    scores ~1.0 against a full-volume optimal, which overstates the match. These
+    add volume sensitivity:
+
+      pearson : shape/direction only (kept for continuity with the old score)
+      cosine  : direction AND relative magnitude of the two vectors; drops when
+                actual volume is much smaller (or larger) than optimal
+      r2      : fraction of actual's variance explained by treating optimal as a
+                direct predictor. Scale-sensitive on purpose — goes negative when
+                optimal's magnitude is far from actual's, exposing volume gaps.
+
+    Returns {"pearson", "cosine", "r2"}.
+    """
+    mask = actual_kw.notna() & optimal_kw.notna()
+    if mask.sum() < 10:
+        return {"pearson": np.nan, "cosine": np.nan, "r2": np.nan}
+    a = actual_kw[mask].to_numpy()
+    o = optimal_kw[mask].to_numpy()
+
+    pearson = (float(np.corrcoef(a, o)[0, 1])
+               if a.std() > 0 and o.std() > 0 else np.nan)
+
+    na, no = np.linalg.norm(a), np.linalg.norm(o)
+    cosine = float(np.dot(a, o) / (na * no)) if na > 0 and no > 0 else np.nan
+
+    ss_res = float(np.sum((a - o) ** 2))
+    ss_tot = float(np.sum((a - a.mean()) ** 2))
+    r2 = (1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    return {"pearson": pearson, "cosine": cosine, "r2": r2}
+
+
 def actual_revenue(actual_kw, price_mwh, dt=1/12):
-    """Estimate revenue from actual dispatch using RT LMP."""
+    """Total revenue from actual dispatch settled at the given price (RT LMP)."""
     return float((actual_kw / 1000 * price_mwh * dt).sum())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INTENTIONALLY UNUSED — kept for future per-strategy day-ahead modeling.
+#
+# settle_two_part() assumes the day-ahead commitment passed in is the one the
+# strategy being evaluated *actually planned around* — i.e. a DA commitment
+# specific to that strategy. That assumption does NOT hold in this pipeline:
+# RT arbitrage, scarcity, and hybrid are all optimized solely against RT prices
+# and never plan a DA position. Feeding them a SHARED DA commitment (the DA
+# arbitrage schedule) fabricates large RT-priced deviations by construction,
+# producing economically invalid revenue and breaking cross-strategy comparison.
+#
+# Revenue accounting therefore uses single-basis settlement in main (each
+# strategy on the price signal it optimized against). This function stays unused
+# until per-strategy day-ahead commitments are implemented; once each strategy
+# carries its own DA schedule, it can be reinstated with that schedule passed as
+# da_commit_kw.
+# ──────────────────────────────────────────────────────────────────────────────
+def settle_two_part(da_commit_kw, rt_actual_kw, da_price, rt_price, dt=1/12):
+    """
+    Two-settlement market revenue. CURRENTLY UNUSED (see the note above).
+
+    Real ISO energy markets settle in two parts:
+        - the day-ahead committed position clears at the DA price
+        - any real-time deviation from that commitment clears at the RT price
+      revenue = DA_commit * DA_price  +  (RT_actual - DA_commit) * RT_price
+
+    da_commit_kw : the day-ahead scheduled power (kW, discharge positive). MUST be
+                   a commitment the evaluated strategy actually planned around —
+                   passing a shared/foreign DA schedule yields invalid revenue.
+    rt_actual_kw : the realized 5-min dispatch (kW, discharge positive).
+
+    Returns a per-interval revenue Series ($). Sum it for the total.
+    """
+    da_commit_kw = pd.Series(da_commit_kw).reset_index(drop=True)
+    rt_actual_kw = pd.Series(rt_actual_kw).reset_index(drop=True)
+    da_price     = pd.Series(da_price).reset_index(drop=True)
+    rt_price     = pd.Series(rt_price).reset_index(drop=True)
+
+    da_rev = da_commit_kw / 1000 * da_price * dt
+    rt_rev = (rt_actual_kw - da_commit_kw) / 1000 * rt_price * dt
+    return da_rev + rt_rev
 
 
 def _safe_corr(a, b):
@@ -360,6 +532,16 @@ print(f"    Capacity:       {cap_mw} MW / {cap_mwh} MWh")
 print(f"    RTE:            {rte*100:.1f}%")
 print(f"    Cycle limit:    {max_cy}/yr → {max_cycles:.1f} for {n_days} days")
 
+# ── Initial SOC — seed from the project's actual first valid SOC reading ──────
+# (Realism: the optimal dispatch path now starts where the battery actually was,
+#  instead of an arbitrary 50%.) Falls back to 50% only if SOC is entirely null.
+soc_series = df["soc_pct"].dropna()
+soc_init   = (float(soc_series.iloc[0]) / 100 * cap_mwh
+              if len(soc_series) else cap_mwh * 0.5)
+soc_init   = max(0.0, min(cap_mwh, soc_init))
+print(f"    Initial SOC:    {soc_init/cap_mwh*100:.1f}% "
+      f"({soc_init:.0f} MWh, from first actual reading)")
+
 # ── Fill missing LMP with forward fill then backfill ──────────────────────────
 df["lmp_rt"] = df["lmp_rt"].ffill().bfill()
 df["lmp_da"] = df["lmp_da"].ffill().bfill()
@@ -401,37 +583,71 @@ strategies = {
 }
 
 print("\nRunning LP optimizations...")
+print(f"  (charge source: {CHARGE_SOURCE}; degradation: "
+      f"${DEGRADATION_COST_PER_MWH:.0f}/MWh; DA window: {ROLLING_WINDOW_HOURS}h)")
+window_intervals = int(ROLLING_WINDOW_HOURS * 12)   # 5-min intervals per window
 results = {}
 for name, (signal, discharge_ok) in strategies.items():
     print(f"  [{name}] solving...", end=" ", flush=True)
+    sig  = signal.reset_index(drop=True)
     mask = None if discharge_ok is None else discharge_ok.reset_index(drop=True).values
-    res = run_lp(
-        price_signal=signal.reset_index(drop=True),
-        capacity_mw=cap_mw,
-        capacity_mwh=cap_mwh,
-        rte=rte,
-        max_cycles=max_cycles,
-        discharge_mask=mask,
-    )
+    # Charging cost source: free (solar) or node LMP / signal price (grid)
+    charge_sig = pd.Series(np.zeros(len(sig))) if CHARGE_SOURCE == "solar" else None
+
+    if name == "arbitrage_day_ahead":
+        # Realistic benchmark: rolling horizon, no foresight past the window edge
+        res, _ = run_lp_rolling(
+            sig, cap_mw, cap_mwh, rte, max_cycles,
+            window_intervals=window_intervals, discharge_mask=mask,
+            soc_initial=soc_init, charge_price_signal=charge_sig,
+            degradation_cost=DEGRADATION_COST_PER_MWH,
+        )
+        tag = f"rolling {ROLLING_WINDOW_HOURS}h"
+    else:
+        # RT arbitrage stays a single full-foresight solve = upper-bound ceiling
+        res, _ = run_lp(
+            sig, cap_mw, cap_mwh, rte, max_cycles,
+            discharge_mask=mask, soc_initial=soc_init,
+            charge_price_signal=charge_sig,
+            degradation_cost=DEGRADATION_COST_PER_MWH,
+        )
+        tag = "full-foresight ceiling" if name == "arbitrage_real_time" else "full solve"
+
     results[name] = res
-    total_rev = res["optimal_revenue_usd"].sum()
-    print(f"done  →  ${total_rev:,.0f} optimal revenue")
+    gross = res["optimal_revenue_usd"].sum()
+    print(f"done ({tag})  →  ${gross:,.0f} gross @ signal price")
 
-# ── Add all optimal columns to main dataframe ─────────────────────────────────
+# ── Add optimal dispatch + SOC columns to main dataframe ──────────────────────
 for name, res in results.items():
-    df[f"optimal_{name}_kw"]          = res["optimal_power_kw"].values
-    df[f"optimal_{name}_soc_pct"]     = res["optimal_soc_pct"].values
-    df[f"optimal_{name}_revenue_usd"] = res["optimal_revenue_usd"].values
+    df[f"optimal_{name}_kw"]      = res["optimal_power_kw"].values
+    df[f"optimal_{name}_soc_pct"] = res["optimal_soc_pct"].values
 
-# ── Actual revenue (using RT LMP as settlement price) ─────────────────────────
-actual_kw       = df["power_kw"].fillna(0)
-rev_actual      = actual_revenue(actual_kw, df["lmp_rt"])
-df["actual_revenue_usd"] = actual_kw / 1000 * df["lmp_rt"] * (1/12)
+# ── Revenue: single-basis settlement — each strategy on the price it optimized ─
+# Every strategy is settled against the SAME price signal it was optimized
+# against, so the evaluation matches the objective the LP actually solved:
+#   - RT arbitrage, scarcity, hybrid → RT LMP  (they optimized on RT prices)
+#   - DA arbitrage                   → DA LMP  (it optimized on DA prices)
+# strategies[name][0] is exactly that price signal, so we read it straight back.
+# (The shared-commitment two-settlement path was removed: forcing the DA schedule
+#  onto RT-optimized strategies fabricated large deviations priced at RT —
+#  amplified by negative-price hours — and drove every strategy negative. See the
+#  note above settle_two_part.)
+dt_settle = 1.0 / 12
+for name in results:
+    settle_price = strategies[name][0].reset_index(drop=True).values
+    df[f"optimal_{name}_revenue_usd"] = (
+        df[f"optimal_{name}_kw"].values / 1000 * settle_price * dt_settle
+    )
 
-# ── Revenue summary ────────────────────────────────────────────────────────────
+# ── Actual revenue — settled on RT LMP (its true real-time settlement basis) ──
+actual_kw = df["power_kw"].fillna(0)
+df["actual_revenue_usd"] = actual_kw / 1000 * df["lmp_rt"] * dt_settle
+rev_actual = actual_revenue(actual_kw, df["lmp_rt"])
+
+# ── Revenue summary (single-basis totals) ─────────────────────────────────────
 rev_summary = {}
-for name, res in results.items():
-    rev_summary[name] = res["optimal_revenue_usd"].sum()
+for name in results:
+    rev_summary[name] = df[f"optimal_{name}_revenue_usd"].sum()
 
 best_strategy = max(rev_summary, key=rev_summary.get)
 
@@ -443,6 +659,15 @@ for name, res in results.items():
     )
 best_match = max(match_scores, key=lambda k: match_scores[k]
                  if not np.isnan(match_scores[k]) else -999)
+
+# Magnitude-aware metrics alongside Pearson (Change 6): cosine + R².
+# best_match stays Pearson-based for continuity (Route 2 keys off it), but these
+# expose when a high correlation hides a large volume mismatch.
+sim_metrics = {}
+for name, res in results.items():
+    sim_metrics[name] = dispatch_similarity(
+        actual_kw, pd.Series(res["optimal_power_kw"].values)
+    )
 
 # ── Revenue leakage ────────────────────────────────────────────────────────────
 leakage_vs_best = rev_summary[best_strategy] - rev_actual
@@ -473,11 +698,18 @@ print(f"    {'ACTUAL':<25} ${rev_actual:>14,.0f}")
 print(f"\n  Revenue leakage vs best strategy: ${leakage_vs_best:,.0f}")
 print(f"  Leakage per day:                  ${leakage_vs_best/n_days:,.0f}/day")
 
-print(f"\n  Strategy match scores (correlation with actual dispatch):")
-for name, score in sorted(match_scores.items(), key=lambda x: x[1], reverse=True):
-    bar = "█" * int(abs(score) * 20) if not np.isnan(score) else ""
+print(f"\n  Strategy match scores vs actual dispatch:")
+print(f"    (Pearson = shape/direction only; cosine & R2 are magnitude-aware, so")
+print(f"     a directionally-right but low-volume match no longer scores high)")
+for name, score in sorted(match_scores.items(),
+                          key=lambda x: (x[1] if not np.isnan(x[1]) else -999),
+                          reverse=True):
+    sm     = sim_metrics[name]
+    bar    = "█" * int(abs(score) * 20) if not np.isnan(score) else ""
     marker = " ◄ CLOSEST MATCH" if name == best_match else ""
-    print(f"    {name:<25} {score:>+.3f}  {bar}{marker}")
+    cos    = f"{sm['cosine']:+.3f}" if not np.isnan(sm['cosine']) else " n/a "
+    r2     = f"{sm['r2']:+.3f}"     if not np.isnan(sm['r2'])     else " n/a "
+    print(f"    {name:<25} {score:>+.3f}  cos {cos}  R2 {r2}  {bar}{marker}")
 
 print(f"\n  Interpretation:")
 print(f"    The utility's actual dispatch most closely resembles the")

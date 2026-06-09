@@ -35,14 +35,60 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════════════════
 
 # API + file
-EIA_API_KEY       = "Your key here"
-POWERFACTORS_FILE = r"Your PowerFactors export file path here (e.g. C:\VS code\project_data.csv)"
+EIA_API_KEY       = "Insert EIA API key here"   # get from https://www.eia.gov/opendata/register.php
+POWERFACTORS_FILE = r"Insert path to PowerFactors CSV export here"  # e.g. r"C:\path\to\export.csv"
 
-# CAISO pricing node — match to your project's region
-#   NP15 = Northern California  → TH_NP15_GEN-APND
-#   SP15 = Southern California  → TH_SP15_GEN-APND
-#   ZP26 = Central California   → TH_ZP26_GEN-APND
-CAISO_NODE = "TH_NP15_GEN-APND"
+# ── Region selection ────────────────────────────────────────────────────────
+# Each entry bundles everything that varies by ISO. To add a region later,
+# add one dictionary entry — no logic changes needed.
+REGION_CONFIG = {
+    "CAISO": {
+        "iso_class":      "CAISO",          # gridstatus class name
+        "eia_respondent": "CISO",           # EIA-930 respondent code
+        "timezone":       "America/Los_Angeles",
+        # NP15 = Northern CA, SP15 = Southern CA, ZP26 = Central CA
+        "default_node":   "TH_NP15_GEN-APND",
+    },
+    "ERCOT": {
+        "iso_class":      "Ercot",
+        "eia_respondent": "ERCO",
+        "timezone":       "America/Chicago",
+        "default_node":   "HB_HOUSTON",     # VERIFY node string before relying on it
+    },
+    "PJM": {
+        "iso_class":      "PJM",
+        "eia_respondent": "PJM",
+        "timezone":       "America/New_York",
+        "default_node":   "PJM-RTO",        # VERIFY node string before relying on it
+    },
+    "MISO": {
+        "iso_class":      "MISO",
+        "eia_respondent": "MISO",
+        "timezone":       "America/New_York",
+        "default_node":   "ARKANSAS.HUB",   # VERIFY node string before relying on it
+    },
+    "SPP": {
+        "iso_class":      "SPP",
+        "eia_respondent": "SWPP",
+        "timezone":       "America/Chicago",
+        "default_node":   "SPPNORTH_HUB",   # VERIFY node string before relying on it
+    },
+    "NYISO": {
+        "iso_class":      "NYISO",
+        "eia_respondent": "NYIS",
+        "timezone":       "America/New_York",
+        "default_node":   "N.Y.C.",         # VERIFY node string before relying on it
+    },
+    "ISONE": {
+        "iso_class":      "ISONE",
+        "eia_respondent": "ISNE",
+        "timezone":       "America/New_York",
+        "default_node":   "NEMASSBOST",     # VERIFY node string before relying on it
+    },
+}
+
+REGION = "CAISO"            # pick one key from REGION_CONFIG above
+NODE   = None               # None → use the region's default_node, or paste a specific node
 
 # Battery physical specs — used by the optimizer script
 BATTERY_CAPACITY_MW   = 150     # max charge/discharge rate (MW)
@@ -53,7 +99,9 @@ RTE_FALLBACK          = 0.90    # assumed RTE if insufficient data to calculate
                                 # (used by optimizer when measured RTE unavailable)
 
 # ── Internal ──────────────────────────────────────────────────────────────────
-PACIFIC = pytz.timezone("America/Los_Angeles")
+cfg     = REGION_CONFIG[REGION]
+NODE    = NODE or cfg["default_node"]
+PACIFIC = pytz.timezone(cfg["timezone"])   # local timezone for the selected region
 
 # Signal keywords used to auto-detect and map PowerFactors columns
 # Edit only if PowerFactors changes its column naming convention
@@ -159,21 +207,21 @@ print(f"  Total 5-min intervals: {len(raw)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — PULL CAISO LMP (Day-Ahead + Real-Time)
+# STEP 2 — PULL ISO LMP (Day-Ahead + Real-Time)
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "="*60)
-print("STEP 2: Pulling CAISO LMP from gridstatus")
+print(f"STEP 2: Pulling {REGION} LMP from gridstatus (node: {NODE})")
 print("="*60)
 
-caiso = gridstatus.CAISO()
+caiso = getattr(gridstatus, cfg["iso_class"])()
 
 print(f"  Pulling Day-Ahead LMP for {start_date} to {end_date}...")
 lmp_da_raw = caiso.get_lmp(
     date=str(start_date),
     end=str(end_date),
     market="DAY_AHEAD_HOURLY",
-    locations=[CAISO_NODE],
+    locations=[NODE],
 )
 print(f"  Got {len(lmp_da_raw)} hourly DA rows")
 
@@ -182,7 +230,7 @@ lmp_rt_raw = caiso.get_lmp(
     date=str(start_date),
     end=str(end_date),
     market="REAL_TIME_5_MIN",
-    locations=[CAISO_NODE],
+    locations=[NODE],
 )
 print(f"  Got {len(lmp_rt_raw)} real-time rows")
 
@@ -225,7 +273,7 @@ eia_params = {
     "api_key": EIA_API_KEY,
     "frequency": "hourly",
     "data[0]": "value",
-    "facets[respondent][]": "CISO",
+    "facets[respondent][]": cfg["eia_respondent"],
     "start": start_utc.strftime("%Y-%m-%dT%H"),
     "end":   end_utc.strftime("%Y-%m-%dT%H"),
     "sort[0][column]": "period",
@@ -235,7 +283,7 @@ eia_params = {
 eia_params["facets[type][0]"] = "D"
 eia_params["facets[type][1]"] = "DF"
 
-print(f"  Pulling EIA-930 for CISO {start_date} to {end_date}...")
+print(f"  Pulling EIA-930 for {cfg['eia_respondent']} {start_date} to {end_date}...")
 eia_resp = requests.get(
     "https://api.eia.gov/v2/electricity/rto/region-data/data/",
     params=eia_params,
