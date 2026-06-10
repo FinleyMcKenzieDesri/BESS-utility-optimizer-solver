@@ -16,6 +16,8 @@ REQUIREMENTS:
     pip install pandas numpy pulp
 """
 
+import json
+import math
 import warnings
 import numpy  as np
 import pandas as pd
@@ -44,7 +46,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-UNIFIED_CSV = r"C:\VS code\Arroyo Hybrid_unified_2025-09-01_to_2026-06-10.csv"
+UNIFIED_CSV = r"Enter_path_to_your_unified_csv_here.csv"  # e.g. r"C:\VS code\Arroyo unified_2026-05-12_to_2026-06-11.csv"
 
 # Override battery specs here if needed — otherwise pulled from unified CSV
 # Set to None to use values embedded in the unified CSV by the pipeline
@@ -94,6 +96,10 @@ MAX_LAG_INTERVALS      = 36      # +/- lag window for timing search (36 x 5min =
 # the model can fit a daily "bump" rather than a forced linear slope.
 DECISION_FEATURES      = ["lmp_rt", "lmp_da", "soc_pct", "grid_stress_mwh",
                           "hour_sin", "hour_cos", "irradiance_wm2"]
+# Driver signals correlated against ACTUAL dispatch for the report's
+# behavioral-drivers summary (Models 1 & 2). irradiance_wm2 is included
+# deliberately so its role surfaces alongside the price/stress signals.
+DRIVER_SIGNALS         = ["lmp_rt", "lmp_da", "irradiance_wm2", "grid_stress_mwh"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -504,6 +510,63 @@ def dispatch_decision_model(df, features, discharge_threshold):
     return out
 
 
+def driver_correlations(df, signal_cols):
+    """
+    Model 1 — plain Pearson correlation of ACTUAL dispatch (power_kw, discharge
+    positive) against each external driver signal. Answers "which single signal
+    moves with the battery's behavior?" — the simplest of the three views the
+    report compares.
+
+    Returns {signal: corr}.
+    """
+    return {c: _safe_corr(df["power_kw"], df[c])
+            for c in signal_cols if c in df.columns}
+
+
+def regime_driver_correlations(df, signal_cols, price_hi, soc_hi):
+    """
+    Model 2 — the same actual-vs-driver correlations, but sliced by regime
+    (high-price and high-SOC intervals). A driver that only matters when prices
+    are high, or when the battery is full, shows up here but is washed out in the
+    global Model-1 number.
+
+    Returns {signal: {"all", "hi_price", "hi_soc"}}.
+    """
+    hp = df["lmp_rt"] > price_hi
+    hs = df["soc_pct"] > soc_hi
+    out = {}
+    for c in signal_cols:
+        if c not in df.columns:
+            continue
+        out[c] = {
+            "all":      _safe_corr(df["power_kw"],     df[c]),
+            "hi_price": _safe_corr(df["power_kw"][hp], df[c][hp]),
+            "hi_soc":   _safe_corr(df["power_kw"][hs], df[c][hs]),
+        }
+    return out
+
+
+def _jsonable(obj):
+    """
+    Recursively coerce a structure into something json.dump can serialize with
+    standard settings: numpy scalars → Python scalars, tuples → lists, NaN/inf →
+    None (valid JSON null, unlike Python's default NaN literal). Used only for
+    the behavioral-drivers sidecar.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        f = float(obj)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(obj, np.ndarray):
+        return _jsonable(obj.tolist())
+    return obj
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -806,7 +869,39 @@ out_file   = f"{project}_optimized_{start_str}_to_{end_str}.csv"
 
 df.to_csv(out_file, index=False)
 
+# ── Behavioral-drivers sidecar (consumed by DesriReport.py) ───────────────────
+# The report's "behavioral drivers" summary compares three views of what explains
+# the utility's dispatch. Rather than recompute them downstream, we emit the
+# already-computed results next to the CSV as {..}_drivers.json. The report reads
+# it if present and degrades gracefully if it is absent.
+drivers_sidecar = {
+    "model1_pearson":  driver_correlations(df, DRIVER_SIGNALS),
+    "model2_regime":   regime_driver_correlations(df, DRIVER_SIGNALS,
+                                                  price_hi, HIGH_SOC_PCT),
+    "model3_logistic": dm,
+    "conditioned_correlations": {
+        name: conditioned_correlations(df, "power_kw", f"optimal_{name}_kw",
+                                       price_hi, HIGH_SOC_PCT)
+        for name in strategies
+    },
+    "lagged_correlation": lag,
+    "best_match": best_match,
+    "params": {
+        "driver_signals":        DRIVER_SIGNALS,
+        "high_price_quantile":   HIGH_PRICE_QUANTILE,
+        "price_hi":              float(price_hi),
+        "high_soc_pct":          HIGH_SOC_PCT,
+        "discharge_threshold_kw": DISCHARGE_THRESHOLD_KW,
+        "has_sklearn":           HAS_SKLEARN,
+        "has_shap":              HAS_SHAP,
+    },
+}
+drivers_file = f"{project}_optimized_{start_str}_to_{end_str}_drivers.json"
+with open(drivers_file, "w", encoding="utf-8") as fjson:
+    json.dump(_jsonable(drivers_sidecar), fjson, indent=2)
+
 print(f"\n  Output saved: {out_file}")
+print(f"  Drivers sidecar: {drivers_file}")
 print(f"  Columns added: " + ", ".join(
     [f"optimal_{n}_kw" for n in strategies] +
     [f"optimal_{n}_revenue_usd" for n in strategies] +
