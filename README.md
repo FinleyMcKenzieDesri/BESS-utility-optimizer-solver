@@ -4,25 +4,9 @@ Currently set to the CAISO region
 
 You may have to pip install various plugins
 
-In the DesriPipeline.py document replace the following lines of code with your own data
+Read though the configuration tabs at the beginning of each document. If you wish to run the entire sequence only run the DesriRun.py and fill out those API keys and inputs. If you wish to run individual filed you will then need to configure each individual one.
 
-Line 38:  EIA_API_KEY = "your API key from https://www.eia.gov/opendata/"
-
-Line 39: POWERFACTORS_FILE = r"your system route to Power Factors Spreadsheet"
- 
-  spreadsheet must contain  Effective Irradiance, SOC, Active Power BESS,
-  Active Export Energy BESS, Active Import Energy BESS,
-  Round Trip Efficiency Denominator, Round Trip Efficiency Numerator
-
-Line 48: BATTERY_CAPACITY_MW   = # max charge/discharge rate (MW)
-
-Line 49: BATTERY_CAPACITY_MWH  = # total energy storage capacity (MWh)
-                                # if unknown, use: BATTERY_CAPACITY_MW * 4
-Line 51: MAX_CYCLES_PER_YEAR   = # warranty/contractual full-cycle limit per year
-
-Line 52: RTE_FALLBACK          = # assumed RTE if insufficient data to calculate
-
-DesriPipelineTemplate.py considerations
+DesriPipeline.py considerations
 Regional Configuration — Known Limitations
 This pipeline supports multiple ISOs (CAISO, ERCOT, PJM, MISO, SPP, NYISO, ISONE) via the REGION_CONFIG selector. Be aware of the following before trusting output for any non-CAISO region:
 
